@@ -160,7 +160,8 @@ final class ArticleRepository
     {
         $words = str_word_count(strip_tags($markdown));
 
-        return max(1, (int) ceil($words / 200));
+        return max(1, intdiv($words + self::WORDS_PER_MINUTE - 1, self::WORDS_PER_MINUTE));
+
     }
 
     private function converter(): MarkdownConverter

@@ -7,9 +7,12 @@ namespace App\Blog;
 use League\CommonMark\Environment\Environment;
 use League\CommonMark\Extension\CommonMark\CommonMarkCoreExtension;
 use League\CommonMark\Extension\FrontMatter\Data\SymfonyYamlFrontMatterParser;
+use League\CommonMark\Extension\FrontMatter\Exception\InvalidFrontMatterException;
 use League\CommonMark\Extension\FrontMatter\FrontMatterParser;
 use League\CommonMark\Extension\GithubFlavoredMarkdownExtension;
 use League\CommonMark\MarkdownConverter;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 /**
@@ -22,15 +25,22 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
  */
 final class ArticleRepository
 {
+    private const WORDS_PER_MINUTE = 200;
+    private const SLUG_PATTERN = '/^[a-z0-9-]+$/';
+
     private ?MarkdownConverter $converter = null;
     private ?FrontMatterParser $frontMatter = null;
 
     /** @var array<string, Article>|null memoized metadata, keyed by slug */
     private ?array $index = null;
 
+    /** @var list<Article>|null memoized index, most recent first */
+    private ?array $sorted = null;
+
     public function __construct(
         #[Autowire('%kernel.project_dir%/content/articles')]
         private readonly string $articlesDir,
+        private readonly LoggerInterface $logger = new NullLogger(),
     ) {
     }
 
@@ -41,11 +51,13 @@ final class ArticleRepository
      */
     public function findAll(): array
     {
-        $articles = array_values($this->loadIndex());
+        if (null === $this->sorted) {
+            $articles = array_values($this->loadIndex());
+            usort($articles, static fn (Article $a, Article $b): int => $b->date <=> $a->date);
+            $this->sorted = $articles;
+        }
 
-        usort($articles, static fn (Article $a, Article $b): int => $b->date <=> $a->date);
-
-        return $articles;
+        return $this->sorted;
     }
 
     /**
@@ -83,7 +95,7 @@ final class ArticleRepository
     public function findOneBySlug(string $slug): ?Article
     {
         // Reject anything that could escape the articles directory.
-        if (!preg_match('/^[a-z0-9-]+$/', $slug)) {
+        if (!preg_match(self::SLUG_PATTERN, $slug)) {
             return null;
         }
 
@@ -106,6 +118,13 @@ final class ArticleRepository
 
         $this->index = [];
         foreach (glob($this->articlesDir.'/*.md') ?: [] as $file) {
+            // Keep the listing consistent with findOneBySlug(): a file whose
+            // name isn't a valid slug would be listed but always 404.
+            if (!preg_match(self::SLUG_PATTERN, basename($file, '.md'))) {
+                $this->logger->warning('Skipping article with invalid slug filename: {file}', ['file' => $file]);
+                continue;
+            }
+
             $article = $this->hydrate($file, withContent: false);
             if (null !== $article) {
                 $this->index[$article->slug] = $article;
@@ -122,18 +141,20 @@ final class ArticleRepository
             return null;
         }
 
-        $parsed = $this->frontMatterParser()->parse($raw);
+        // One malformed front matter block must not take down the whole blog.
+        try {
+            $parsed = $this->frontMatterParser()->parse($raw);
+        } catch (InvalidFrontMatterException $e) {
+            $this->logger->error('Invalid front matter in {file}: {message}', ['file' => $file, 'message' => $e->getMessage()]);
+
+            return null;
+        }
+
         /** @var array<string, mixed> $meta */
         $meta = $parsed->getFrontMatter() ?? [];
         $body = $parsed->getContent();
 
         $slug = basename($file, '.md');
-
-        try {
-            $date = new \DateTimeImmutable((string) ($meta['date'] ?? 'now'));
-        } catch (\Exception) {
-            $date = new \DateTimeImmutable();
-        }
 
         /** @var list<string> $tags */
         $tags = array_values(array_map('strval', (array) ($meta['tags'] ?? [])));
@@ -144,13 +165,35 @@ final class ArticleRepository
             description: (string) ($meta['description'] ?? ''),
             author: (string) ($meta['author'] ?? 'Dispatch Team'),
             role: (string) ($meta['role'] ?? ''),
-            date: $date,
+            date: $this->parseDate($meta['date'] ?? null, $file),
             category: (string) ($meta['category'] ?? 'General'),
             tags: $tags,
             readingTime: $this->readingTime($body),
             featured: (bool) ($meta['featured'] ?? false),
             content: $withContent ? $this->converter()->convert($body)->getContent() : null,
         );
+    }
+
+    /**
+     * Symfony YAML turns an unquoted `date: 2026-10-06` into a Unix timestamp
+     * (int), which `new \DateTimeImmutable((string) $int)` cannot parse. Handle
+     * every shape the parser can return, and fall back to the file's mtime
+     * (stable per deploy) rather than "now" (changes on every request).
+     */
+    private function parseDate(mixed $value, string $file): \DateTimeImmutable
+    {
+        try {
+            return match (true) {
+                $value instanceof \DateTimeInterface => \DateTimeImmutable::createFromInterface($value),
+                \is_int($value) => new \DateTimeImmutable('@'.$value),
+                \is_string($value) && '' !== $value => new \DateTimeImmutable($value),
+                default => throw new \InvalidArgumentException('missing date'),
+            };
+        } catch (\Exception $e) {
+            $this->logger->warning('Bad or missing date in {file}, using file mtime: {message}', ['file' => $file, 'message' => $e->getMessage()]);
+
+            return new \DateTimeImmutable('@'.(filemtime($file) ?: time()));
+        }
     }
 
     /**
@@ -161,13 +204,17 @@ final class ArticleRepository
         $words = str_word_count(strip_tags($markdown));
 
         return max(1, intdiv($words + self::WORDS_PER_MINUTE - 1, self::WORDS_PER_MINUTE));
-
     }
 
     private function converter(): MarkdownConverter
     {
         if (null === $this->converter) {
-            $environment = new Environment();
+            $environment = new Environment([
+                // Block `javascript:` and similar link targets. Raw HTML stays
+                // allowed so authors can embed video; switch html_input to
+                // 'escape' if articles never need it.
+                'allow_unsafe_links' => false,
+            ]);
             $environment->addExtension(new CommonMarkCoreExtension());
             $environment->addExtension(new GithubFlavoredMarkdownExtension());
 

@@ -22,6 +22,8 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
  */
 final class ArticleRepository
 {
+    private const WORDS_PER_MINUTE = 200;
+
     private ?MarkdownConverter $converter = null;
     private ?FrontMatterParser $frontMatter = null;
 
@@ -161,7 +163,6 @@ final class ArticleRepository
         $words = str_word_count(strip_tags($markdown));
 
         return max(1, intdiv($words + self::WORDS_PER_MINUTE - 1, self::WORDS_PER_MINUTE));
-
     }
 
     private function converter(): MarkdownConverter

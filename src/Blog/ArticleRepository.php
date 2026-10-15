@@ -19,9 +19,15 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
  * its metadata; the filename (minus extension) becomes the URL slug. Metadata
  * is parsed lazily and memoized; the markdown body is only rendered to HTML
  * when a single article is requested for its detail page.
+ *
+ * Articles marked `draft: true`, and articles whose `date` is in the future
+ * (scheduled posts), are hidden: they are left out of every listing and
+ * cannot be fetched by slug until they are published.
  */
 final class ArticleRepository
 {
+    private const WORDS_PER_MINUTE = 200;
+
     private ?MarkdownConverter $converter = null;
     private ?FrontMatterParser $frontMatter = null;
 
@@ -129,10 +135,11 @@ final class ArticleRepository
 
         $slug = basename($file, '.md');
 
-        try {
-            $date = new \DateTimeImmutable((string) ($meta['date'] ?? 'now'));
-        } catch (\Exception) {
-            $date = new \DateTimeImmutable();
+        $date = $this->parseDate($meta['date'] ?? null);
+
+        // Drafts and scheduled (future-dated) articles are not visible yet.
+        if ($this->isDraft($meta) || $date > new \DateTimeImmutable('now')) {
+            return null;
         }
 
         /** @var list<string> $tags */
@@ -151,6 +158,40 @@ final class ArticleRepository
             featured: (bool) ($meta['featured'] ?? false),
             content: $withContent ? $this->converter()->convert($body)->getContent() : null,
         );
+    }
+
+    /**
+     * Parses the front matter `date`, whether quoted (a string) or unquoted
+     * (Symfony YAML turns unquoted dates into an int Unix timestamp).
+     */
+    private function parseDate(mixed $raw): \DateTimeImmutable
+    {
+        if (\is_int($raw)) {
+            return (new \DateTimeImmutable('@'.$raw))
+                ->setTimezone(new \DateTimeZone(date_default_timezone_get()));
+        }
+
+        if ($raw instanceof \DateTimeInterface) {
+            return \DateTimeImmutable::createFromInterface($raw);
+        }
+
+        if (\is_string($raw) && '' !== trim($raw)) {
+            try {
+                return new \DateTimeImmutable($raw);
+            } catch (\Exception) {
+                // Fall through to "now" for unparseable values.
+            }
+        }
+
+        return new \DateTimeImmutable();
+    }
+
+    /**
+     * @param array<string, mixed> $meta
+     */
+    private function isDraft(array $meta): bool
+    {
+        return filter_var($meta['draft'] ?? false, \FILTER_VALIDATE_BOOLEAN);
     }
 
     /**

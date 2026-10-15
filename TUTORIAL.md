@@ -419,6 +419,20 @@ You ran the complete Upsun and Dispatch loop:
 That's the everyday workflow for teams on Upsun. Every pull request gets a running preview and an
 automatic review, so you review behavior and correctness instead of only a static diff.
 
+### Drafts and scheduled posts
+
+Articles live in `content/articles/*.md`. Add `draft: true` to an article's front matter to hide it,
+or give it a future `date` to schedule it: until that date it is left out of every list and its URL
+returns a 404, and it appears on its own once the date arrives. The `date` can be quoted or unquoted.
+
+```yaml
+---
+title: "Coming soon"
+date: 2026-12-01      # unquoted works too: "2026-12-01"
+draft: true           # remove (or set to false) to publish
+---
+```
+
 ---
 
 ## Cleanup (optional)
